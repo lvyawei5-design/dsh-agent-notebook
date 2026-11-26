@@ -475,7 +475,7 @@ function promptText(store, agent) {
     '你有一个 `notebook` 工具，它和左侧栏的「记事本」是同一个本子。用户写下的要求是长期偏好，每次工作都要先看、要遵守；你自己记下的内容可供参考。',
     '',
     '## 记录要求',
-    '完成一件有意义的事（改文件、跑命令、做出交付物等）之后，调用 `notebook` 工具，action=add，用用户听得懂的大白话记一条：做了什么、结果如何。普通聊天不用记。不要记琐碎步骤，也不要记密码、令牌等敏感信息。',
+    '只在这次工作留下了下次还需要找到的东西时，才用 `notebook` 工具 action=add 记一条：文件、目录、插件或发布地址在哪里。用一句话写清“做了什么 + 位置”，不要写过程细节；细节下次重新跑即可。普通聊天、只查询、只跑命令看结果，不用记。不要记密码、令牌等敏感信息。',
   )
   const userNotes = store.notes.filter((note) => note.enabled && note.source === 'user').slice(0, PROMPT_USER_LIMIT)
   const agentNotes = store.notes.filter((note) => note.enabled && note.source === 'agent').slice(0, PROMPT_AGENT_LIMIT)
@@ -500,9 +500,101 @@ function isNotebookAdd(argumentsText) {
 
 const lastAutoTurn = new Map()
 
+function isWindowsLocation(value) {
+  return /^[A-Za-z]:\\/.test(value) || /^\\\\/.test(value)
+}
+
+function normalizeLocation(value) {
+  let text = String(value || '').trim()
+  text = text.replace(/^["'`<]+/, '').replace(/["'`>]+$/, '')
+  text = text.replace(/[.,;:!?，。；：！？）】》]+$/, '')
+  return text
+}
+
+function addLocation(list, value) {
+  const text = normalizeLocation(value)
+  if (!text) return
+  if (!isWindowsLocation(text) && !/^https?:\/\//i.test(text)) return
+  const key = text.toLowerCase()
+  if (list.some((item) => item.toLowerCase() === key)) return
+  list.push(text)
+}
+
+/** 两三个文件在同一个目录时，记目录比记每个文件更有用。 */
+function commonDirectory(paths) {
+  const split = paths.map((value) => value.split('\\'))
+  const length = Math.min(...split.map((parts) => parts.length))
+  let end = 0
+  while (end < length && split.every((parts) => parts[end].toLowerCase() === split[0][end].toLowerCase())) end += 1
+  if (end < 2) return null
+  const common = split[0].slice(0, end).join('\\')
+  return common.length > 3 ? common : null
+}
+
+/** 把收尾那段话压成一句短标题，去掉 Markdown 和链接。 */
+function summarySentence(text, limit) {
+  const value = String(text || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/<([^>]+)>/g, '$1')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const sentence = value.split(/[。！？!?]/)[0] || value
+  return oneLine(sentence, limit)
+}
+
+/** 只收「写出来的文件、交付物、安装的插件」，不收普通编辑和读文件。 */
+function toolLocations(toolCalls) {
+  const locations = []
+  for (const item of toolCalls) {
+    if (item.name !== 'write' && item.name !== 'present' && item.name !== 'plugin_manager') continue
+    let args
+    try {
+      args = JSON.parse(item.arguments)
+    } catch {
+      continue
+    }
+    if (item.name === 'write') {
+      addLocation(locations, args?.file_path || args?.path)
+    } else if (item.name === 'present' && Array.isArray(args?.files)) {
+      for (const file of args.files) addLocation(locations, typeof file === 'string' ? file : file?.path)
+    } else if (item.name === 'plugin_manager' && args?.action === 'install_bundle') {
+      addLocation(locations, args.target)
+    }
+  }
+  return locations
+}
+
+/** 命令跑出来的东西，收尾里明确写了 Windows 路径的，也收。 */
+function textLocations(text) {
+  const locations = []
+  const value = String(text || '')
+  for (const match of value.matchAll(/"([A-Za-z]:\\[^"]+)"/g)) addLocation(locations, match[1])
+  for (const match of value.matchAll(/'([A-Za-z]:\\[^']+)'/g)) addLocation(locations, match[1])
+  for (const match of value.matchAll(/(?<!["'`])([A-Za-z]:\\[^\s"'`<>|]+)/g)) addLocation(locations, match[1])
+  return locations
+}
+
+function artifactLocations(toolCalls, assistantText) {
+  let locations = toolLocations(toolCalls)
+  if (locations.length === 0) locations = textLocations(assistantText)
+  const windows = locations.filter(isWindowsLocation)
+  if (windows.length >= 2) {
+    const common = commonDirectory(windows)
+    if (common) locations = [common, ...locations.filter((value) => !isWindowsLocation(value))]
+  }
+  return locations.slice(0, 3)
+}
+
 /**
- * 一回合结束后自动记一条：只有这一回合真的调用过工具才记，避免普通聊天刷屏。
- * 如果助手已经主动调用 notebook add，就不再自动记，避免重复。
+ * 一回合结束后，只在确实留下了文件/插件/地址时记一条简短的位置记录。
+ * 普通聊天、只读、只跑命令看结果、没有留下东西的工作，一律不记。
+ * 如果助手收尾时已经主动调用 notebook add，就不再自动记。
  */
 async function autoRecord(store, session, event) {
   if (!event || event.type !== 'turn/end') return
@@ -532,7 +624,7 @@ async function autoRecord(store, session, event) {
       return
     }
   }
-  let summary = ''
+  let assistantText = ''
   for (let index = turnEvents.length - 1; index >= 0; index -= 1) {
     const item = turnEvents[index]
     if (item.type !== 'assistant/message') continue
@@ -544,19 +636,17 @@ async function autoRecord(store, session, event) {
       .join('\n')
       .trim()
     if (text) {
-      summary = text
+      assistantText = text
       break
     }
   }
-  if (!summary) {
-    const names = [...new Set(toolCalls.map((item) => item.name))].slice(0, 5)
-    summary = `用了 ${names.join('、')} 做了一步操作。`
-  }
-  summary = oneLine(summary, 280)
-  if (!summary) return
+  const locations = artifactLocations(toolCalls, assistantText)
+  if (locations.length === 0) return
+  const subject = summarySentence(assistantText, 60)
+  const text = (subject ? `${subject} 位置：${locations.join('；')}` : `位置：${locations.join('；')}`).slice(0, 320)
   lastAutoTurn.set(header.id, turn)
   await store.add({
-    text: /[。！？.!?]$/.test(summary) ? summary : `${summary}。`,
+    text,
     source: 'agent',
     sessionId: header.id,
     auto: true,
@@ -581,7 +671,7 @@ function createNotebookTool(store) {
   }
   return {
     name: 'notebook',
-    description: '读取或修改用户的本地记事本。启用中的长期要求会自动出现在每次工作前的系统提示里；完成有意义的工作后，用 action=add 记一条用户能听懂的大白话总结。',
+    description: '读取或修改用户的本地记事本。只在留下文件、目录、插件或发布地址时记一条简短的位置记录；启用中的长期要求会自动出现在每次工作前的系统提示里。',
     parameters: {
       type: 'object',
       properties: {
