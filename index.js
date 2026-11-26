@@ -1,0 +1,641 @@
+/**
+ * 记事本 Host 半。
+ *
+ * 职责：
+ * 1. 把记事持久化到当前 profile 的 data/notebook/notebook.json；
+ * 2. 注册 `notebook` 工具，让助手能读写记事；
+ * 3. 在每次模型步骤组装系统提示时，把「启用中的用户要求 + 最近的助手记录」放进提示；
+ * 4. 每个回合结束时，如果这一回合确实动过工具，就把助手的总结自动记成一条大白话；
+ * 5. 给左侧栏面板注册取数路由（/api/dsh-notebook/state 与 /action）。
+ */
+import { readFileSync, renameSync } from 'node:fs'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import path from 'node:path'
+
+const API = '/api/dsh-notebook'
+const BODY_LIMIT = 64 * 1024
+const NOTE_TEXT_LIMIT = 4000
+const AUTO_NOTE_LIMIT = 120
+const PROMPT_USER_LIMIT = 40
+const PROMPT_AGENT_LIMIT = 10
+const PROMPT_TEXT_LIMIT = 8000
+const CONVERSATION_LIMIT = 40
+const LOG = '[dsh-notebook]'
+
+/** 当前 profile 的数据文件；DSH_PROFILE_DIR 由 profile 启动的 Harness 注入。 */
+function dataFilePath() {
+  const profileDir = process.env.DSH_PROFILE_DIR
+    || path.join(process.env.DSH_HOME || path.join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop')
+  return path.join(profileDir, 'data', 'notebook', 'notebook.json')
+}
+
+function newId() {
+  return `nb_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+function oneLine(text, limit) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim()
+  return value.length > limit ? `${value.slice(0, limit)}…` : value
+}
+
+function noteFrom(raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  if (typeof raw.id !== 'string' || typeof raw.text !== 'string') return null
+  const note = {
+    id: raw.id,
+    text: raw.text.slice(0, NOTE_TEXT_LIMIT),
+    enabled: raw.enabled !== false,
+    source: raw.source === 'user' ? 'user' : 'agent',
+    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+  }
+  if (raw.auto === true) note.auto = true
+  if (typeof raw.sessionId === 'string' && raw.sessionId) note.sessionId = raw.sessionId
+  if (typeof raw.deletedAt === 'number') note.deletedAt = raw.deletedAt
+  return note
+}
+
+class NotebookStore {
+  constructor(file) {
+    this.file = file
+    this.notes = []
+    this.trash = []
+    this.sessions = {}
+    this.titles = {}
+    this.revision = 0
+    this.tail = Promise.resolve()
+    this.loadSync()
+  }
+
+  /** 同步载入，保证第一次系统提示组装就能看到已有记事。 */
+  loadSync() {
+    let raw
+    try {
+      raw = readFileSync(this.file, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn(`${LOG} 读取记事本失败：`, error)
+      return
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      this.notes = Array.isArray(parsed?.notes) ? parsed.notes.map(noteFrom).filter(Boolean) : []
+      this.trash = Array.isArray(parsed?.trash) ? parsed.trash.map(noteFrom).filter(Boolean) : []
+      this.sessions = parsed?.sessions && typeof parsed.sessions === 'object' && !Array.isArray(parsed.sessions)
+        ? parsed.sessions
+        : {}
+      this.revision = typeof parsed?.revision === 'number' ? parsed.revision : 0
+    } catch (error) {
+      // 坏文件先留档，绝不直接覆盖。
+      console.warn(`${LOG} 记事本文件解析失败，已备份原文件：`, error)
+      try {
+        renameSync(this.file, `${this.file}.broken-${Date.now()}`)
+      } catch {}
+      this.notes = []
+      this.trash = []
+      this.sessions = {}
+    }
+  }
+
+  /** 串行、原子地保存；多个会话同时写入时不会互相截断。 */
+  persist() {
+    this.revision += 1
+    const snapshot = JSON.stringify({
+      version: 1,
+      revision: this.revision,
+      notes: this.notes,
+      trash: this.trash,
+      sessions: this.sessions,
+    }, null, 2)
+    const run = async () => {
+      await mkdir(path.dirname(this.file), { recursive: true })
+      const temp = `${this.file}.${process.pid}.tmp`
+      await writeFile(temp, snapshot, 'utf8')
+      await rename(temp, this.file)
+    }
+    const next = this.tail.then(run, run)
+    this.tail = next.catch((error) => console.warn(`${LOG} 保存记事本失败：`, error))
+    return next
+  }
+
+  find(id) {
+    return this.notes.find((note) => note.id === id)
+  }
+
+  /** 自动记录只保留最近的若干条，避免活动流无限膨胀；用户写的记事永不自动清理。 */
+  pruneAutoNotes() {
+    const autoNotes = this.notes.filter((note) => note.auto === true)
+    if (autoNotes.length <= AUTO_NOTE_LIMIT) return
+    const remove = new Set(autoNotes.slice(0, autoNotes.length - AUTO_NOTE_LIMIT).map((note) => note.id))
+    this.notes = this.notes.filter((note) => !remove.has(note.id))
+  }
+
+  async add({ text, source, sessionId, auto }) {
+    const now = Date.now()
+    const note = {
+      id: newId(),
+      text: String(text || '').trim().slice(0, NOTE_TEXT_LIMIT),
+      enabled: true,
+      source: source === 'user' ? 'user' : 'agent',
+      createdAt: now,
+      updatedAt: now,
+    }
+    if (auto === true) note.auto = true
+    if (sessionId) note.sessionId = sessionId
+    this.notes.unshift(note)
+    this.pruneAutoNotes()
+    await this.persist()
+    return note
+  }
+
+  async setEnabled(id, enabled) {
+    const note = this.find(id)
+    if (note === undefined) return null
+    note.enabled = enabled !== false
+    note.updatedAt = Date.now()
+    await this.persist()
+    return note
+  }
+
+  async setText(id, text) {
+    const note = this.find(id)
+    if (note === undefined) return null
+    const value = String(text || '').trim()
+    if (!value) return null
+    note.text = value.slice(0, NOTE_TEXT_LIMIT)
+    note.updatedAt = Date.now()
+    await this.persist()
+    return note
+  }
+
+  /** 删除 = 移入回收站，可恢复。 */
+  async remove(id) {
+    const index = this.notes.findIndex((note) => note.id === id)
+    if (index < 0) return null
+    const [note] = this.notes.splice(index, 1)
+    const deleted = { ...note, deletedAt: Date.now() }
+    this.trash.unshift(deleted)
+    await this.persist()
+    return deleted
+  }
+
+  async restore(id) {
+    const index = this.trash.findIndex((note) => note.id === id)
+    if (index < 0) return null
+    const [note] = this.trash.splice(index, 1)
+    delete note.deletedAt
+    note.updatedAt = Date.now()
+    this.notes.unshift(note)
+    await this.persist()
+    return note
+  }
+
+  async purge(id) {
+    const index = this.trash.findIndex((note) => note.id === id)
+    if (index < 0) return false
+    this.trash.splice(index, 1)
+    await this.persist()
+    return true
+  }
+
+  sessionEnabled(id) {
+    const entry = this.sessions[id]
+    return entry === undefined || entry.enabled !== false
+  }
+
+  async setSession(id, enabled) {
+    this.sessions[id] = {
+      ...(this.sessions[id] || {}),
+      enabled: enabled !== false,
+      updatedAt: Date.now(),
+    }
+    await this.persist()
+    return this.sessions[id]
+  }
+
+  /** 面板「对话」页的数据：最近的顶层会话 + 各自的记事本开关。 */
+  async conversations(sessionQuery) {
+    const rows = []
+    const seen = new Set()
+    if (sessionQuery && typeof sessionQuery.listSessions === 'function') {
+      let records = []
+      try {
+        records = await sessionQuery.listSessions()
+      } catch (error) {
+        console.warn(`${LOG} 读取会话列表失败：`, error)
+      }
+      for (const record of records) {
+        const header = record?.header
+        if (!header || typeof header.id !== 'string' || seen.has(header.id)) continue
+        if (header.origin === 'subagent') continue
+        seen.add(header.id)
+        rows.push({
+          id: header.id,
+          title: this.titles[header.id] || '',
+          cwd: typeof header.cwd === 'string' ? header.cwd : '',
+          createdAt: typeof header.createdAt === 'number' ? header.createdAt : 0,
+          enabled: this.sessionEnabled(header.id),
+        })
+        if (rows.length >= CONVERSATION_LIMIT) break
+      }
+      const missing = rows.filter((row) => !row.title).map((row) => row.id)
+      if (missing.length > 0 && typeof sessionQuery.readTitleSnapshots === 'function') {
+        try {
+          const results = await sessionQuery.readTitleSnapshots(missing)
+          for (const result of results) {
+            if (result?.status !== 'fulfilled') continue
+            const title = result.value?.title?.title
+            if (typeof title === 'string' && title) {
+              this.titles[result.sessionId] = title
+              const row = rows.find((candidate) => candidate.id === result.sessionId)
+              if (row) row.title = title
+            }
+          }
+        } catch (error) {
+          console.warn(`${LOG} 读取会话标题失败：`, error)
+        }
+      }
+    }
+    // 即使会话已经不在当前语料里，也保留用户做过的选择，方便取消/恢复。
+    for (const [id, entry] of Object.entries(this.sessions)) {
+      if (seen.has(id)) continue
+      rows.push({
+        id,
+        title: this.titles[id] || '',
+        cwd: '',
+        createdAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : 0,
+        enabled: entry.enabled !== false,
+      })
+    }
+    return rows
+  }
+}
+
+function respond(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'private, no-store',
+    },
+  })
+}
+
+function failure(message) {
+  return respond({ ok: false, error: { code: 'notebook', message } })
+}
+
+async function readJsonBody(request) {
+  const declared = Number(request.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > BODY_LIMIT) throw new Error('请求内容太大')
+  const text = await request.text()
+  if (Buffer.byteLength(text, 'utf8') > BODY_LIMIT) throw new Error('请求内容太大')
+  if (text.trim() === '') throw new Error('请求内容为空')
+  const value = JSON.parse(text)
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('请求内容必须是对象')
+  return value
+}
+
+async function stateOf(ctx, store) {
+  return {
+    revision: store.revision,
+    notes: store.notes,
+    trash: store.trash,
+    conversations: await store.conversations(ctx.get('sessionQuery')),
+  }
+}
+
+/** 面板写操作。所有写操作都回一份最新的完整状态，前端不需要再跑一次读。 */
+async function applyPanelAction(store, body) {
+  const action = typeof body.action === 'string' ? body.action : ''
+  const id = typeof body.id === 'string' ? body.id : ''
+  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  switch (action) {
+    case 'add': {
+      if (!text) throw new Error('先写点内容再记下来')
+      return { note: await store.add({ text, source: 'user' }) }
+    }
+    case 'toggle':
+    case 'update': {
+      if (action === 'update') {
+        if (!text) throw new Error('内容不能为空')
+        const note = await store.setText(id, text)
+        if (note === null) throw new Error('找不到这条记事')
+        return { note }
+      }
+      const note = await store.setEnabled(id, body.enabled !== false)
+      if (note === null) throw new Error('找不到这条记事')
+      return { note }
+    }
+    case 'delete': {
+      const note = await store.remove(id)
+      if (note === null) throw new Error('找不到这条记事')
+      return { note }
+    }
+    case 'restore': {
+      const note = await store.restore(id)
+      if (note === null) throw new Error('回收站里没有这条记事')
+      return { note }
+    }
+    case 'purge': {
+      const ok = await store.purge(id)
+      if (!ok) throw new Error('回收站里没有这条记事')
+      return {}
+    }
+    case 'session': {
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+      if (!sessionId) throw new Error('缺少对话 id')
+      return { session: await store.setSession(sessionId, body.enabled !== false) }
+    }
+    default:
+      throw new Error(`未知操作：${action || '(空)'}`)
+  }
+}
+
+function registerRoutes(ctx, store) {
+  const connection = ctx.get('connection')
+  if (!connection || typeof connection.fetch?.register !== 'function') {
+    console.warn(`${LOG} connection 服务不可用，左侧栏面板没有取数通道`)
+    return () => {}
+  }
+  const disposers = [
+    connection.fetch.register({
+      path: `${API}/state`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        try {
+          return respond({ ok: true, value: await stateOf(ctx, store) })
+        } catch (error) {
+          return failure(String(error?.message || error))
+        }
+      },
+    }),
+    connection.fetch.register({
+      path: `${API}/action`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await readJsonBody(request)
+          const result = await applyPanelAction(store, body)
+          return respond({ ok: true, value: await stateOf(ctx, store), result })
+        } catch (error) {
+          return failure(String(error?.message || error))
+        }
+      },
+    }),
+  ]
+  return async () => {
+    for (const dispose of disposers.reverse()) {
+      try {
+        await dispose()
+      } catch {}
+    }
+  }
+}
+
+/** 系统提示里的一段记事本；没有启用内容时只留下「怎么记」的说明。 */
+function appendPromptNotes(lines, title, entries, formatLine) {
+  if (entries.length === 0) return
+  lines.push('', title)
+  let added = 0
+  for (const note of entries) {
+    const line = formatLine(note, added + 1)
+    // 先保住前面的使用说明和记录要求；记事太多时只展开能放下的部分。
+    if (lines.join('\n').length + line.length + 1 > PROMPT_TEXT_LIMIT - 160) break
+    lines.push(line)
+    added += 1
+  }
+  if (added < entries.length) lines.push(`- …还有 ${entries.length - added} 条没有展开`)
+}
+
+function promptText(store, agent) {
+  const sessionId = agent && typeof agent.id === 'string' ? agent.id : undefined
+  const enabled = sessionId === undefined || store.sessionEnabled(sessionId)
+  const lines = ['# 记事本（跨对话的长期记忆）']
+  if (!enabled) {
+    lines.push('', '用户已经把本对话的记事本关掉了。这次工作不要引用记事本里的内容，也不要把新内容记进记事本。')
+    return lines.join('\n')
+  }
+  lines.push(
+    '',
+    '你有一个 `notebook` 工具，它和左侧栏的「记事本」是同一个本子。用户写下的要求是长期偏好，每次工作都要先看、要遵守；你自己记下的内容可供参考。',
+    '',
+    '## 记录要求',
+    '完成一件有意义的事（改文件、跑命令、做出交付物等）之后，调用 `notebook` 工具，action=add，用用户听得懂的大白话记一条：做了什么、结果如何。普通聊天不用记。不要记琐碎步骤，也不要记密码、令牌等敏感信息。',
+  )
+  const userNotes = store.notes.filter((note) => note.enabled && note.source === 'user').slice(0, PROMPT_USER_LIMIT)
+  const agentNotes = store.notes.filter((note) => note.enabled && note.source === 'agent').slice(0, PROMPT_AGENT_LIMIT)
+  if (userNotes.length > 0) {
+    appendPromptNotes(lines, '## 用户写下的要求（优先遵守）', userNotes, (note, index) => `${index}. ${oneLine(note.text, 500)}`)
+  } else {
+    lines.push('', '目前用户还没有写下长期要求。')
+  }
+  appendPromptNotes(lines, '## 你最近记下的事（参考）', agentNotes, (note) => `- ${oneLine(note.text, 300)}`)
+  const text = lines.join('\n')
+  return text.length > PROMPT_TEXT_LIMIT ? `${text.slice(0, PROMPT_TEXT_LIMIT)}\n…（记事本内容过长，已截断）` : text
+}
+
+function isNotebookAdd(argumentsText) {
+  try {
+    const args = JSON.parse(argumentsText)
+    return args && args.action === 'add'
+  } catch {
+    return false
+  }
+}
+
+const lastAutoTurn = new Map()
+
+/**
+ * 一回合结束后自动记一条：只有这一回合真的调用过工具才记，避免普通聊天刷屏。
+ * 如果助手已经主动调用 notebook add，就不再自动记，避免重复。
+ */
+async function autoRecord(store, session, event) {
+  if (!event || event.type !== 'turn/end') return
+  const reason = event.data && event.data.reason
+  if (!reason || reason.kind !== 'completed') return
+  const header = session && session.header
+  if (!header || typeof header.id !== 'string' || header.origin === 'subagent') return
+  // 用户把这个对话的记事本关掉后，自动记录也不该继续写。
+  if (!store.sessionEnabled(header.id)) return
+  const turn = event.data.turn
+  if (lastAutoTurn.get(header.id) === turn) return
+  let events
+  try {
+    events = session.snapshotEvents(0, session.seq)
+  } catch {
+    return
+  }
+  const turnEvents = events.filter((item) => item && item.data && typeof item.data === 'object' && item.data.turn === turn)
+  const toolCalls = turnEvents.filter((item) => item.type === 'tool/call')
+  if (toolCalls.length === 0) return
+  // 只有「收尾时主动记了一条」才跳过自动记录；中途记的笔记不算工作总结。
+  const notebookAdds = toolCalls.filter((item) => item.name === 'notebook' && isNotebookAdd(item.arguments))
+  if (notebookAdds.length > 0) {
+    const lastAddIndex = toolCalls.lastIndexOf(notebookAdds[notebookAdds.length - 1])
+    if (lastAddIndex >= toolCalls.length - 3) {
+      lastAutoTurn.set(header.id, turn)
+      return
+    }
+  }
+  let summary = ''
+  for (let index = turnEvents.length - 1; index >= 0; index -= 1) {
+    const item = turnEvents[index]
+    if (item.type !== 'assistant/message') continue
+    const content = item.data && item.data.message && item.data.message.content
+    if (!Array.isArray(content)) continue
+    const text = content
+      .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+      .trim()
+    if (text) {
+      summary = text
+      break
+    }
+  }
+  if (!summary) {
+    const names = [...new Set(toolCalls.map((item) => item.name))].slice(0, 5)
+    summary = `用了 ${names.join('、')} 做了一步操作。`
+  }
+  summary = oneLine(summary, 280)
+  if (!summary) return
+  lastAutoTurn.set(header.id, turn)
+  await store.add({
+    text: /[。！？.!?]$/.test(summary) ? summary : `${summary}。`,
+    source: 'agent',
+    sessionId: header.id,
+    auto: true,
+  })
+}
+
+function createNotebookTool(store) {
+  const listMessage = () => {
+    const lines = []
+    if (store.notes.length === 0) {
+      lines.push('记事本现在是空的。')
+    } else {
+      const enabled = store.notes.filter((note) => note.enabled).length
+      lines.push(`记事本共 ${store.notes.length} 条（启用 ${enabled} 条）：`)
+      store.notes.forEach((note, index) => {
+        const source = note.source === 'user' ? '用户' : note.auto === true ? '助手自动' : '助手'
+        lines.push(`${index + 1}. [${note.enabled ? '✓' : '×'}][${source}] ${oneLine(note.text, 300)}（id: ${note.id}）`)
+      })
+    }
+    if (store.trash.length > 0) lines.push('', `回收站里还有 ${store.trash.length} 条已删除的记事。`)
+    return { ok: true, notes: store.notes, trash: store.trash, message: lines.join('\n') }
+  }
+  return {
+    name: 'notebook',
+    description: '读取或修改用户的本地记事本。启用中的长期要求会自动出现在每次工作前的系统提示里；完成有意义的工作后，用 action=add 记一条用户能听懂的大白话总结。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'add', 'update', 'toggle', 'delete', 'restore', 'purge', 'session'],
+          description: '要做什么。list 读取；add 新增；update 改一条；toggle 勾选/收起；delete 移入回收站；restore 从回收站恢复；purge 彻底删除；session 切换某个对话是否使用记事本。',
+        },
+        text: { type: 'string', description: 'add / update 的正文。用用户听得懂的大白话，不要写术语和琐碎步骤。' },
+        id: { type: 'string', description: '目标记事 id（toggle / update / delete / restore / purge 需要）。' },
+        enabled: { type: 'boolean', description: 'toggle 或 session 时为 true 表示带上，false 表示收起。' },
+        sessionId: { type: 'string', description: 'session 操作要切换的对话 id。' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        const text = value && typeof value === 'object' && typeof value.message === 'string'
+          ? value.message
+          : JSON.stringify(value)
+        return [{ type: 'text', text }]
+      },
+    },
+    async execute(args, exec) {
+      const action = String(args?.action || '')
+      const sessionId = exec.agent?.id
+      if ((action === 'list' || action === 'add') && sessionId && !store.sessionEnabled(sessionId)) {
+        return { ok: false, message: '本对话的记事本已被用户关闭，不要读取或记录记事。' }
+      }
+      try {
+        switch (action) {
+          case 'list':
+            return listMessage()
+          case 'add': {
+            const text = String(args?.text || '').trim()
+            if (!text) return { ok: false, message: 'text 不能为空。' }
+            const note = await store.add({ text, source: 'agent', sessionId: exec.agent?.id })
+            return { ok: true, note, message: `已记下：${note.text}` }
+          }
+          case 'update': {
+            const note = await store.setText(String(args?.id || ''), args?.text)
+            if (note === null) return { ok: false, message: '找不到这条记事，或者新内容为空。' }
+            return { ok: true, note, message: `已改成：${note.text}` }
+          }
+          case 'toggle': {
+            const note = await store.setEnabled(String(args?.id || ''), args?.enabled !== false)
+            if (note === null) return { ok: false, message: '找不到这条记事。' }
+            return { ok: true, note, message: `已${note.enabled ? '带上' : '收起'}：${note.text}` }
+          }
+          case 'delete': {
+            const note = await store.remove(String(args?.id || ''))
+            if (note === null) return { ok: false, message: '找不到这条记事。' }
+            return { ok: true, note, message: `已移入回收站：${note.text}` }
+          }
+          case 'restore': {
+            const note = await store.restore(String(args?.id || ''))
+            if (note === null) return { ok: false, message: '回收站里没有这条记事。' }
+            return { ok: true, note, message: `已恢复：${note.text}` }
+          }
+          case 'purge': {
+            const ok = await store.purge(String(args?.id || ''))
+            return ok
+              ? { ok: true, message: '已彻底删除。' }
+              : { ok: false, message: '回收站里没有这条记事。' }
+          }
+          case 'session': {
+            const sessionId = String(args?.sessionId || '')
+            if (!sessionId) return { ok: false, message: 'sessionId 不能为空。' }
+            const entry = await store.setSession(sessionId, args?.enabled !== false)
+            return {
+              ok: true,
+              session: { sessionId, enabled: entry.enabled !== false },
+              message: `对话 ${sessionId} 的记事本已${entry.enabled !== false ? '打开' : '关闭'}。`,
+            }
+          }
+          default:
+            return { ok: false, message: `未知 action：${action || '(空)'}` }
+        }
+      } catch (error) {
+        return { ok: false, message: `记事本操作失败：${String(error?.message || error)}` }
+      }
+    },
+  }
+}
+
+export const inject = ['systemPrompt', 'tools']
+
+export function apply(ctx) {
+  const store = new NotebookStore(dataFilePath())
+
+  ctx.effect(() => ctx.systemPrompt.section({
+    name: 'notebook:memory',
+    // 放在团队/计划策略之后、工具说明之前；每次模型步骤都会重新求值。
+    order: 640,
+    // 用户记事里可能出现 {{...}}，绝不能交给提示变量插值。
+    interpolate: false,
+    text: (context) => promptText(store, context?.agent),
+  }))
+
+  ctx.effect(() => ctx.tools.register(createNotebookTool(store)))
+
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    void autoRecord(store, session, event).catch((error) => console.warn(`${LOG} 自动记录失败：`, error))
+  }))
+
+  ctx.effect(() => registerRoutes(ctx, store))
+}
