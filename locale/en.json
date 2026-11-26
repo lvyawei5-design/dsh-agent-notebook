@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Notebook",
+    "description": "A notebook in the left sidebar. The assistant records what it did in plain language; you can write long-term instructions such as which software may be used freely. Checked notes are read before every task, and each entry can be unchecked, deleted, or restored."
+  }
+}
