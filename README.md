@@ -2,13 +2,13 @@
 
 A local notebook for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with a left-sidebar entry.
 
-The assistant records what it did in plain language, you can write long-term instructions (for example which software may be used freely), and checked notes are injected into the system prompt before every task. Each note has a checkbox; notes can be edited with undo/redo; each conversation can be switched on or off; deletions go to a trash list that can be restored.
+The assistant records only the files, plugins, and locations it produced, not process details. You can write long-term instructions (for example which software may be used freely), and checked notes are injected into the system prompt before every task. Each note has a checkbox; notes can be edited with undo/redo; each conversation can be switched on or off; deletions go to a trash list that can be restored.
 
 ## 中文简介
 
 左侧栏里的「记事本」：
 
-- **它做过的事会自己记**：一个回合里只要真的动过工具，回合结束就把收尾总结用大白话记一条；如果它收尾时已经主动记过，就不重复。
+- **它只记位置**：只有做出文件、插件、交付物或发布地址时，才自动记一条很短的“做了什么 + 在哪里”；普通聊天、只查东西、只跑命令看结果都不记，过程细节不记。
 - **你也能往里面记**：写下长期要求，比如「这个软件可以随便用」。
 - **改错能撤回**：每条记事都有「更改」；改完可以「保存」，不满意点「撤回」，连续点会一步步退回，撤过头还能「重做」。最多保留 20 步。
 - **每条都能勾选/取消**：勾选的内容会在它每次工作前先读一遍；取消只是先收起来。
