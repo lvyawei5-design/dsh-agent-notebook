@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-agent-notebook",
   "version": "1.0.0",
   "description": "A sidebar notebook for DeepSeek Harness: the assistant records what it did in plain language, checked notes are read before every task, and each note or conversation can be toggled, deleted, or restored.",
