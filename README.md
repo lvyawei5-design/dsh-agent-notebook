@@ -24,11 +24,7 @@ Once this package is published to npm:
 dsh plugin --profile web add dsh-agent-notebook
 ```
 
-From a GitHub Release tarball:
-
-```sh
-dsh plugin --profile web add https://github.com/lvyawei5-design/dsh-agent-notebook/releases/latest/download/dsh-agent-notebook.tgz
-```
+Once listed in the plugin market, install it from the market entry; the entry uses the version-free release tarball.
 
 From a local checkout:
 
