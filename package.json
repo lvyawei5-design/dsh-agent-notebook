@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-notebook",
-  "version": "1.1.1",
-  "description": "A sidebar notebook for DeepSeek Harness: it keeps only the files, plugins, and locations the assistant produced; checked notes are read before every task, and notes can be edited with undo and redo.",
+  "version": "1.2.0",
+  "description": "A sidebar notebook for DeepSeek Harness: the assistant keeps what matters, notes can be pinned, edited with undo/redo, filtered per conversation, and stale records are cleaned automatically.",
   "type": "module",
   "license": "MIT",
   "author": "dsh-agent-notebook contributors",
