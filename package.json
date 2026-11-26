@@ -1,0 +1,53 @@
+﻿{
+  "name": "dsh-agent-notebook",
+  "version": "1.0.0",
+  "description": "A sidebar notebook for DeepSeek Harness: the assistant records what it did in plain language, checked notes are read before every task, and each note or conversation can be toggled, deleted, or restored.",
+  "type": "module",
+  "license": "MIT",
+  "author": "dsh-agent-notebook contributors",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "notebook",
+    "memory",
+    "sidebar"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lvyawei5-design/dsh-agent-notebook.git"
+  },
+  "homepage": "https://github.com/lvyawei5-design/dsh-agent-notebook#readme",
+  "bugs": {
+    "url": "https://github.com/lvyawei5-design/dsh-agent-notebook/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "assets/icon-180.png",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
