@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
 
     const DICT_EN = {
       'panel.title': 'Notebook',
-      'panel.subtitle': 'What the assistant did is recorded here in plain language. Everything you write here is read before each task.',
+      'panel.subtitle': 'The assistant only records the files, plugins, and locations it produced; everything you write here is still read before each task.',
       'tabs.notes': 'Notes',
       'tabs.sessions': 'Conversations',
       'tabs.trash': 'Deleted',
@@ -63,7 +63,7 @@ window.__ModuleLoader__.load({
 
     const DICT_ZH = {
       'panel.title': '记事本',
-      'panel.subtitle': '它做过的事会记在这里，用大白话写。你写下的内容，它每次动手前都会先看一遍。',
+      'panel.subtitle': '它只把做出来的文件、插件和地址记在这里；你写的要求照常每次先看，过程细节不记。',
       'tabs.notes': '记事',
       'tabs.sessions': '对话',
       'tabs.trash': '已删除',
