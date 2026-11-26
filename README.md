@@ -1,4 +1,4 @@
-﻿# dsh-agent-notebook
+# dsh-agent-notebook
 
 A local notebook for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with a left-sidebar entry.
 
