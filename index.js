@@ -9,7 +9,7 @@
  * 5. 给左侧栏面板注册取数路由（/api/dsh-notebook/state 与 /action）。
  */
 import { readFileSync, renameSync } from 'node:fs'
-import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
@@ -18,6 +18,8 @@ const BODY_LIMIT = 64 * 1024
 const NOTE_TEXT_LIMIT = 4000
 const NOTE_HISTORY_LIMIT = 20
 const AUTO_NOTE_LIMIT = 120
+const AUTO_NOTE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+const WORK_CLEANUP_LIMIT = 80
 const PROMPT_USER_LIMIT = 40
 const PROMPT_AGENT_LIMIT = 10
 const PROMPT_TEXT_LIMIT = 8000
@@ -52,6 +54,7 @@ function noteFrom(raw) {
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
   }
   if (raw.auto === true) note.auto = true
+  if (raw.pinned === true) note.pinned = true
   if (typeof raw.sessionId === 'string' && raw.sessionId) note.sessionId = raw.sessionId
   if (typeof raw.deletedAt === 'number') note.deletedAt = raw.deletedAt
   const history = Array.isArray(raw.history)
@@ -75,6 +78,8 @@ class NotebookStore {
     this.revision = 0
     this.tail = Promise.resolve()
     this.loadSync()
+    const removed = this.cleanupNotes()
+    if (removed > 0) void this.persist()
   }
 
   /** 同步载入，保证第一次系统提示组装就能看到已有记事。 */
@@ -131,15 +136,23 @@ class NotebookStore {
     return this.notes.find((note) => note.id === id)
   }
 
-  /** 自动记录只保留最近的若干条，避免活动流无限膨胀；用户写的记事永不自动清理。 */
+  /** 自动记录只留最近 30 天、最多 120 条；用户写的和置顶的永不自动清理。 */
   pruneAutoNotes() {
-    const autoNotes = this.notes.filter((note) => note.auto === true)
+    const cutoff = Date.now() - AUTO_NOTE_RETENTION_MS
+    this.notes = this.notes.filter((note) => !(note.auto === true && note.pinned !== true && note.createdAt < cutoff))
+    const autoNotes = this.notes.filter((note) => note.auto === true && note.pinned !== true)
     if (autoNotes.length <= AUTO_NOTE_LIMIT) return
     const remove = new Set(autoNotes.slice(0, autoNotes.length - AUTO_NOTE_LIMIT).map((note) => note.id))
     this.notes = this.notes.filter((note) => !remove.has(note.id))
   }
 
-  async add({ text, source, sessionId, auto }) {
+  cleanupNotes() {
+    const before = this.notes.length
+    this.pruneAutoNotes()
+    return before - this.notes.length
+  }
+
+  async add({ text, source, sessionId, auto, pinned }) {
     const now = Date.now()
     const note = {
       id: newId(),
@@ -150,6 +163,7 @@ class NotebookStore {
       updatedAt: now,
     }
     if (auto === true) note.auto = true
+    if (pinned === true) note.pinned = true
     if (sessionId) note.sessionId = sessionId
     this.notes.unshift(note)
     this.pruneAutoNotes()
@@ -161,6 +175,18 @@ class NotebookStore {
     const note = this.find(id)
     if (note === undefined) return null
     note.enabled = enabled !== false
+    note.updatedAt = Date.now()
+    await this.persist()
+    return note
+  }
+
+  async setPinned(id, pinned) {
+    const note = this.find(id)
+    if (note === undefined) return null
+    const next = pinned === true
+    if (note.pinned === next) return note
+    if (next) note.pinned = true
+    else delete note.pinned
     note.updatedAt = Date.now()
     await this.persist()
     return note
@@ -355,7 +381,8 @@ async function applyPanelAction(store, body) {
   switch (action) {
     case 'add': {
       if (!text) throw new Error('先写点内容再记下来')
-      return { note: await store.add({ text, source: 'user' }) }
+      // 用户亲手写的默认置顶，可以点图钉取消。
+      return { note: await store.add({ text, source: 'user', pinned: true }) }
     }
     case 'toggle':
     case 'update': {
@@ -383,6 +410,16 @@ async function applyPanelAction(store, body) {
       const note = await store.redoText(id)
       if (note === null) throw new Error('没有可重做的更改')
       return { note }
+    }
+    case 'pin': {
+      const note = await store.setPinned(id, body.pinned === true)
+      if (note === null) throw new Error('找不到这条记事')
+      return { note }
+    }
+    case 'cleanup': {
+      const removed = store.cleanupNotes()
+      if (removed > 0) await store.persist()
+      return { removed }
     }
     case 'restore': {
       const note = await store.restore(id)
@@ -472,19 +509,28 @@ function promptText(store, agent) {
   }
   lines.push(
     '',
-    '你有一个 `notebook` 工具，它和左侧栏的「记事本」是同一个本子。用户写下的要求是长期偏好，每次工作都要先看、要遵守；你自己记下的内容可供参考。',
+    '你有一个 `notebook` 工具，它和左侧栏的「记事本」是同一个本子。用户写下的要求是长期偏好，用户亲手写的记事默认置顶；每次工作都要先看、要遵守，置顶的最优先。你自己记下的内容可供参考。',
     '',
     '## 记录要求',
-    '只在这次工作留下了下次还需要找到的东西时，才用 `notebook` 工具 action=add 记一条：文件、目录、插件或发布地址在哪里。用一句话写清“做了什么 + 位置”，不要写过程细节；细节下次重新跑即可。普通聊天、只查询、只跑命令看结果，不用记。不要记密码、令牌等敏感信息。',
+    '你自己判断什么值得记：关键决定、用户偏好、重要结果、做出来的文件/插件/地址。一次最多 1-2 条，用一句话写清“什么重要 + 在哪里”，不要写过程细节；细节下次重新跑即可。普通聊天、只查询、只跑命令看结果，不记。不要记密码、令牌等敏感信息。',
+    '',
+    '## 清理要求',
+    '工作结束后，用 `notebook` 工具 action=cleanup 清理这次产生的临时文件、测试脚本、缓存和构建产物：先不带 confirm 看一眼列表，确认是临时东西再带 confirm=true。只清临时/缓存/构建产物，不删源码、交付物、用户文件。记事本里过时的自动记录会自己清，不用你管。',
   )
-  const userNotes = store.notes.filter((note) => note.enabled && note.source === 'user').slice(0, PROMPT_USER_LIMIT)
-  const agentNotes = store.notes.filter((note) => note.enabled && note.source === 'agent').slice(0, PROMPT_AGENT_LIMIT)
+  const userNotes = store.notes
+    .filter((note) => note.enabled && note.source === 'user')
+    .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0))
+    .slice(0, PROMPT_USER_LIMIT)
+  const agentNotes = store.notes
+    .filter((note) => note.enabled && note.source === 'agent')
+    .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0))
+    .slice(0, PROMPT_AGENT_LIMIT)
   if (userNotes.length > 0) {
-    appendPromptNotes(lines, '## 用户写下的要求（优先遵守）', userNotes, (note, index) => `${index}. ${oneLine(note.text, 500)}`)
+    appendPromptNotes(lines, '## 用户写下的要求（优先遵守）', userNotes, (note, index) => `${index}. ${note.pinned ? '[置顶] ' : ''}${oneLine(note.text, 500)}`)
   } else {
     lines.push('', '目前用户还没有写下长期要求。')
   }
-  appendPromptNotes(lines, '## 你最近记下的事（参考）', agentNotes, (note) => `- ${oneLine(note.text, 300)}`)
+  appendPromptNotes(lines, '## 你最近记下的事（参考）', agentNotes, (note) => `- ${note.pinned ? '[置顶] ' : ''}${oneLine(note.text, 300)}`)
   const text = lines.join('\n')
   return text.length > PROMPT_TEXT_LIMIT ? `${text.slice(0, PROMPT_TEXT_LIMIT)}\n…（记事本内容过长，已截断）` : text
 }
@@ -653,37 +699,138 @@ async function autoRecord(store, session, event) {
   })
 }
 
+const WORK_CLEANUP_DIRS = new Set(['__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.cache'])
+const WORK_CLEANUP_BUILDS = new Set(['dist', 'build', 'target', 'coverage', '.next', 'out'])
+
+function isDisposableName(name, isDirectory, includeBuilds) {
+  if (isDirectory) {
+    if (WORK_CLEANUP_DIRS.has(name)) return true
+    return includeBuilds === true && WORK_CLEANUP_BUILDS.has(name)
+  }
+  return /\.(tmp|temp|log|bak|old|swp|pyc|tsbuildinfo)$/i.test(name)
+    || name === 'Thumbs.db'
+    || name === '.DS_Store'
+}
+
+/**
+ * 只清工作目录里的临时/缓存/（可选）构建产物。
+ * 不碰源码、交付物、.git、node_modules，也不碰用户手写文件。
+ * 默认 dry-run，只有 confirm=true 才真的删；目录必须是绝对路径。
+ */
+async function cleanupWorkDirectory(directory, options = {}) {
+  if (typeof directory !== 'string' || !path.isAbsolute(directory)) {
+    throw new Error('directory 必须是绝对路径')
+  }
+  const root = path.resolve(directory)
+  const rootInfo = await stat(root)
+  if (!rootInfo.isDirectory()) throw new Error('directory 不是文件夹')
+  const confirm = options.confirm === true
+  const includeBuilds = options.includeBuilds === true
+  const olderThanDays = Number.isFinite(options.olderThanDays) && options.olderThanDays >= 0
+    ? options.olderThanDays
+    : 7
+  const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000
+  const candidates = []
+  let visited = 0
+
+  async function walk(current, depth) {
+    if (depth > 6 || visited > 5000 || candidates.length >= WORK_CLEANUP_LIMIT) return
+    let entries
+    try {
+      entries = await readdir(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (candidates.length >= WORK_CLEANUP_LIMIT) return
+      if (entry.isSymbolicLink()) continue
+      if (entry.name === '.git' || entry.name === 'node_modules') continue
+      const full = path.join(current, entry.name)
+      const isDirectory = entry.isDirectory()
+      if (isDisposableName(entry.name, isDirectory, includeBuilds)) {
+        let info
+        try {
+          info = await stat(full)
+        } catch {
+          continue
+        }
+        if (info.mtimeMs >= cutoff) continue
+        candidates.push({ path: full, directory: isDirectory, bytes: info.size })
+        continue
+      }
+      visited += 1
+      if (isDirectory) await walk(full, depth + 1)
+    }
+  }
+
+  await walk(root, 0)
+  if (!confirm) {
+    return {
+      ok: true,
+      mode: 'dry-run',
+      root,
+      count: candidates.length,
+      candidates,
+      message: candidates.length === 0
+        ? '没有发现需要清理的临时文件。'
+        : `发现 ${candidates.length} 个可清理项（还没删）。确认后带 confirm=true 再执行。`,
+    }
+  }
+  const removed = []
+  for (const candidate of candidates) {
+    try {
+      await rm(candidate.path, { recursive: candidate.directory, force: true })
+      removed.push(candidate.path)
+    } catch {}
+  }
+  return {
+    ok: true,
+    mode: 'purged',
+    root,
+    count: removed.length,
+    removed,
+    message: `已清理 ${removed.length} 个临时/缓存项。`,
+  }
+}
+
 function createNotebookTool(store) {
   const listMessage = () => {
     const lines = []
-    if (store.notes.length === 0) {
+    const ordered = [...store.notes].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0))
+    if (ordered.length === 0) {
       lines.push('记事本现在是空的。')
     } else {
-      const enabled = store.notes.filter((note) => note.enabled).length
-      lines.push(`记事本共 ${store.notes.length} 条（启用 ${enabled} 条）：`)
-      store.notes.forEach((note, index) => {
+      const enabled = ordered.filter((note) => note.enabled).length
+      lines.push(`记事本共 ${ordered.length} 条（启用 ${enabled} 条）：`)
+      ordered.forEach((note, index) => {
         const source = note.source === 'user' ? '用户' : note.auto === true ? '助手自动' : '助手'
-        lines.push(`${index + 1}. [${note.enabled ? '✓' : '×'}][${source}] ${oneLine(note.text, 300)}（id: ${note.id}）`)
+        const pinned = note.pinned === true ? '[置顶]' : ''
+        lines.push(`${index + 1}. [${note.enabled ? '✓' : '×'}][${source}]${pinned} ${oneLine(note.text, 300)}（id: ${note.id}）`)
       })
     }
     if (store.trash.length > 0) lines.push('', `回收站里还有 ${store.trash.length} 条已删除的记事。`)
-    return { ok: true, notes: store.notes, trash: store.trash, message: lines.join('\n') }
+    return { ok: true, notes: ordered, trash: store.trash, message: lines.join('\n') }
   }
   return {
     name: 'notebook',
-    description: '读取或修改用户的本地记事本。只在留下文件、目录、插件或发布地址时记一条简短的位置记录；启用中的长期要求会自动出现在每次工作前的系统提示里。',
+    description: '读写用户的本地记事本，并清理过时记录或工作目录里的临时文件。你自己判断什么值得记：关键决定、用户偏好、重要结果、文件/插件/地址。',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'add', 'update', 'undo', 'redo', 'toggle', 'delete', 'restore', 'purge', 'session'],
-          description: '要做什么。list 读取；add 新增；update 改一条；undo 撤回上一次修改；redo 重做；toggle 勾选/收起；delete 移入回收站；restore 从回收站恢复；purge 彻底删除；session 切换某个对话是否使用记事本。',
+          enum: ['list', 'add', 'update', 'undo', 'redo', 'toggle', 'pin', 'delete', 'restore', 'purge', 'session', 'cleanup'],
+          description: '要做什么。list 读取；add 新增；update 改一条；undo 撤回；redo 重做；toggle 勾选/收起；pin 置顶/取消置顶；delete 移入回收站；restore 恢复；purge 彻底删除；session 切换对话；cleanup 清理旧自动记录；带 directory 时清理工作目录里的临时/缓存文件。',
         },
-        text: { type: 'string', description: 'add / update 的正文。用用户听得懂的大白话，不要写术语和琐碎步骤。' },
-        id: { type: 'string', description: '目标记事 id（update / undo / redo / toggle / delete / restore / purge 需要）。' },
+        text: { type: 'string', description: 'add / update 的正文。简要写清“什么重要 + 在哪里”，不要写过程细节。' },
+        id: { type: 'string', description: '目标记事 id（update / undo / redo / toggle / pin / delete / restore / purge 需要）。' },
         enabled: { type: 'boolean', description: 'toggle 或 session 时为 true 表示带上，false 表示收起。' },
+        pinned: { type: 'boolean', description: 'pin 时为 true 表示置顶，false 表示取消置顶。' },
         sessionId: { type: 'string', description: 'session 操作要切换的对话 id。' },
+        directory: { type: 'string', description: 'cleanup 时可选的工作目录绝对路径；不填只清理记事本里的旧自动记录。' },
+        confirm: { type: 'boolean', description: 'cleanup 工作目录时，false/省略先列出可清理项（dry-run），true 才真的删。' },
+        includeBuilds: { type: 'boolean', description: 'cleanup 工作目录时是否把 dist/build/target/coverage 等构建产物也算进去；默认 false。' },
+        olderThanDays: { type: 'number', description: 'cleanup 工作目录时只清超过这么多天的项；默认 7。' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -733,6 +880,11 @@ function createNotebookTool(store) {
             if (note === null) return { ok: false, message: '找不到这条记事。' }
             return { ok: true, note, message: `已${note.enabled ? '带上' : '收起'}：${note.text}` }
           }
+          case 'pin': {
+            const note = await store.setPinned(String(args?.id || ''), args?.pinned === true)
+            if (note === null) return { ok: false, message: '找不到这条记事。' }
+            return { ok: true, note, message: `已${note.pinned ? '置顶' : '取消置顶'}：${note.text}` }
+          }
           case 'delete': {
             const note = await store.remove(String(args?.id || ''))
             if (note === null) return { ok: false, message: '找不到这条记事。' }
@@ -748,6 +900,19 @@ function createNotebookTool(store) {
             return ok
               ? { ok: true, message: '已彻底删除。' }
               : { ok: false, message: '回收站里没有这条记事。' }
+          }
+          case 'cleanup': {
+            const directory = typeof args?.directory === 'string' ? args.directory : ''
+            if (!directory) {
+              const removed = store.cleanupNotes()
+              if (removed > 0) await store.persist()
+              return { ok: true, removed, message: removed > 0 ? `已清掉 ${removed} 条过时的自动记录。` : '没有需要清理的自动记录。' }
+            }
+            return cleanupWorkDirectory(directory, {
+              confirm: args?.confirm === true,
+              includeBuilds: args?.includeBuilds === true,
+              olderThanDays: Number(args?.olderThanDays),
+            })
           }
           case 'session': {
             const sessionId = String(args?.sessionId || '')
