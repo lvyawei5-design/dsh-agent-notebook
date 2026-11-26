@@ -16,6 +16,7 @@ import path from 'node:path'
 const API = '/api/dsh-notebook'
 const BODY_LIMIT = 64 * 1024
 const NOTE_TEXT_LIMIT = 4000
+const NOTE_HISTORY_LIMIT = 20
 const AUTO_NOTE_LIMIT = 120
 const PROMPT_USER_LIMIT = 40
 const PROMPT_AGENT_LIMIT = 10
@@ -53,6 +54,14 @@ function noteFrom(raw) {
   if (raw.auto === true) note.auto = true
   if (typeof raw.sessionId === 'string' && raw.sessionId) note.sessionId = raw.sessionId
   if (typeof raw.deletedAt === 'number') note.deletedAt = raw.deletedAt
+  const history = Array.isArray(raw.history)
+    ? raw.history.filter((entry) => typeof entry === 'string').slice(-NOTE_HISTORY_LIMIT)
+    : []
+  const future = Array.isArray(raw.future)
+    ? raw.future.filter((entry) => typeof entry === 'string').slice(-NOTE_HISTORY_LIMIT)
+    : []
+  if (history.length > 0) note.history = history
+  if (future.length > 0) note.future = future
   return note
 }
 
@@ -160,9 +169,42 @@ class NotebookStore {
   async setText(id, text) {
     const note = this.find(id)
     if (note === undefined) return null
-    const value = String(text || '').trim()
+    const value = String(text || '').trim().slice(0, NOTE_TEXT_LIMIT)
     if (!value) return null
-    note.text = value.slice(0, NOTE_TEXT_LIMIT)
+    if (value === note.text) return note
+    note.history = [...(note.history || []), note.text].slice(-NOTE_HISTORY_LIMIT)
+    note.future = []
+    note.text = value
+    note.updatedAt = Date.now()
+    await this.persist()
+    return note
+  }
+
+  /** 撤回上一次改动；可以连续撤回，最多保留 NOTE_HISTORY_LIMIT 步。 */
+  async undoText(id) {
+    const note = this.find(id)
+    if (note === undefined) return null
+    const history = note.history || []
+    if (history.length === 0) return null
+    const previous = history[history.length - 1]
+    note.history = history.slice(0, -1)
+    note.future = [...(note.future || []), note.text].slice(-NOTE_HISTORY_LIMIT)
+    note.text = previous
+    note.updatedAt = Date.now()
+    await this.persist()
+    return note
+  }
+
+  /** 重做刚撤回的改动。 */
+  async redoText(id) {
+    const note = this.find(id)
+    if (note === undefined) return null
+    const future = note.future || []
+    if (future.length === 0) return null
+    const next = future[future.length - 1]
+    note.future = future.slice(0, -1)
+    note.history = [...(note.history || []), note.text].slice(-NOTE_HISTORY_LIMIT)
+    note.text = next
     note.updatedAt = Date.now()
     await this.persist()
     return note
@@ -330,6 +372,16 @@ async function applyPanelAction(store, body) {
     case 'delete': {
       const note = await store.remove(id)
       if (note === null) throw new Error('找不到这条记事')
+      return { note }
+    }
+    case 'undo': {
+      const note = await store.undoText(id)
+      if (note === null) throw new Error('没有可撤回的更改')
+      return { note }
+    }
+    case 'redo': {
+      const note = await store.redoText(id)
+      if (note === null) throw new Error('没有可重做的更改')
       return { note }
     }
     case 'restore': {
@@ -535,11 +587,11 @@ function createNotebookTool(store) {
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'add', 'update', 'toggle', 'delete', 'restore', 'purge', 'session'],
-          description: '要做什么。list 读取；add 新增；update 改一条；toggle 勾选/收起；delete 移入回收站；restore 从回收站恢复；purge 彻底删除；session 切换某个对话是否使用记事本。',
+          enum: ['list', 'add', 'update', 'undo', 'redo', 'toggle', 'delete', 'restore', 'purge', 'session'],
+          description: '要做什么。list 读取；add 新增；update 改一条；undo 撤回上一次修改；redo 重做；toggle 勾选/收起；delete 移入回收站；restore 从回收站恢复；purge 彻底删除；session 切换某个对话是否使用记事本。',
         },
         text: { type: 'string', description: 'add / update 的正文。用用户听得懂的大白话，不要写术语和琐碎步骤。' },
-        id: { type: 'string', description: '目标记事 id（toggle / update / delete / restore / purge 需要）。' },
+        id: { type: 'string', description: '目标记事 id（update / undo / redo / toggle / delete / restore / purge 需要）。' },
         enabled: { type: 'boolean', description: 'toggle 或 session 时为 true 表示带上，false 表示收起。' },
         sessionId: { type: 'string', description: 'session 操作要切换的对话 id。' },
       },
@@ -575,6 +627,16 @@ function createNotebookTool(store) {
             const note = await store.setText(String(args?.id || ''), args?.text)
             if (note === null) return { ok: false, message: '找不到这条记事，或者新内容为空。' }
             return { ok: true, note, message: `已改成：${note.text}` }
+          }
+          case 'undo': {
+            const note = await store.undoText(String(args?.id || ''))
+            if (note === null) return { ok: false, message: '没有可撤回的更改。' }
+            return { ok: true, note, message: `已撤回：${note.text}` }
+          }
+          case 'redo': {
+            const note = await store.redoText(String(args?.id || ''))
+            if (note === null) return { ok: false, message: '没有可重做的更改。' }
+            return { ok: true, note, message: `已重做：${note.text}` }
           }
           case 'toggle': {
             const note = await store.setEnabled(String(args?.id || ''), args?.enabled !== false)
