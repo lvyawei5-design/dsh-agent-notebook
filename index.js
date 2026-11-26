@@ -764,6 +764,8 @@ async function cleanupWorkDirectory(directory, options = {}) {
   }
 
   await walk(root, 0)
+  const preview = candidates.slice(0, 20).map((candidate) => `- ${candidate.path}`).join('\n')
+  const more = candidates.length > 20 ? `\n…还有 ${candidates.length - 20} 项` : ''
   if (!confirm) {
     return {
       ok: true,
@@ -773,7 +775,7 @@ async function cleanupWorkDirectory(directory, options = {}) {
       candidates,
       message: candidates.length === 0
         ? '没有发现需要清理的临时文件。'
-        : `发现 ${candidates.length} 个可清理项（还没删）。确认后带 confirm=true 再执行。`,
+        : `发现 ${candidates.length} 个可清理项（还没删）：\n${preview}${more}\n确认后带 confirm=true 再执行。`,
     }
   }
   const removed = []
@@ -789,7 +791,9 @@ async function cleanupWorkDirectory(directory, options = {}) {
     root,
     count: removed.length,
     removed,
-    message: `已清理 ${removed.length} 个临时/缓存项。`,
+    message: removed.length === 0
+      ? '没有可清理的项。'
+      : `已清理 ${removed.length} 个临时/缓存项：\n${removed.slice(0, 20).map((value) => `- ${value}`).join('\n')}${removed.length > 20 ? `\n…还有 ${removed.length - 20} 项` : ''}`,
   }
 }
 
