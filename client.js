@@ -34,6 +34,9 @@ window.__ModuleLoader__.load({
       'notes.toggleHint': 'Checked: the assistant sees this before each task',
       'notes.disabledNote': 'hidden',
       'notes.delete': 'Move to deleted',
+      'notes.pin': 'Pin to top',
+      'notes.unpin': 'Unpin',
+      'notes.pinnedTag': 'Pinned',
       'notes.edit': 'Edit',
       'notes.save': 'Save',
       'notes.cancel': 'Cancel',
@@ -57,7 +60,7 @@ window.__ModuleLoader__.load({
       'trash.deletedAt': 'Deleted',
       'common.refresh': 'Refresh',
       'common.retry': 'Retry',
-      'footer': 'Stored only on this computer. The notebook is read before each task.',
+      'footer': 'Stored only on this computer. Auto-records are kept for 30 days; hand-written and pinned notes are never auto-deleted.',
       'error.prefix': 'Notebook error: ',
     }
 
@@ -81,6 +84,9 @@ window.__ModuleLoader__.load({
       'notes.toggleHint': '勾选后，它每次工作前会看到这条；取消勾选只是先收起来',
       'notes.disabledNote': '已收起',
       'notes.delete': '移到已删除',
+      'notes.pin': '置顶',
+      'notes.unpin': '取消置顶',
+      'notes.pinnedTag': '置顶',
       'notes.edit': '更改',
       'notes.save': '保存',
       'notes.cancel': '取消',
@@ -104,7 +110,7 @@ window.__ModuleLoader__.load({
       'trash.deletedAt': '删除于',
       'common.refresh': '刷新',
       'common.retry': '重试',
-      'footer': '内容只存在本机，不会发到别处；助手每次工作前会先读一遍。',
+      'footer': '内容只存在本机；自动记录保留 30 天，手写和置顶的不会自动删。',
       'error.prefix': '记事本出错了：',
     }
 
@@ -323,6 +329,20 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    function PinGlyph({ size = 15 }) {
+      return h('svg', { viewBox: '0 0 16 16', width: size, height: size, 'aria-hidden': true }, [
+        h('path', {
+          key: 'pin',
+          d: 'M8 1.8c2.4 0 4.2 1.9 4.2 4.2 0 3.1-4.2 8.2-4.2 8.2S3.8 9.1 3.8 6C3.8 3.7 5.6 1.8 8 1.8z',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.3,
+          strokeLinejoin: 'round',
+        }),
+        h('circle', { key: 'hole', cx: 8, cy: 6, r: 1.35, fill: 'currentColor' }),
+      ])
+    }
+
     function ChatGlyph({ size = 28 }) {
       return h('svg', { viewBox: '0 0 24 24', width: size, height: size, 'aria-hidden': true }, h('path', {
         d: 'M4.5 5.5h15v10h-8l-4 3v-3h-3z',
@@ -404,6 +424,7 @@ window.__ModuleLoader__.load({
         : h('div', { key: 'main', className: 'dsh-nb-row-main' }, [
           h('div', { key: 'text', className: 'dsh-nb-row-text' }, note.text),
           h('div', { key: 'meta', className: 'dsh-nb-meta' }, [
+            note.pinned ? h('span', { key: 'pinTag', className: 'dsh-nb-tag' }, t('notes.pinnedTag')) : null,
             h('span', { key: 'tag', className: 'dsh-nb-tag' }, sourceLabel(note, t)),
             formatTime(note.createdAt)
               ? h('span', { key: 'time' }, formatTime(note.createdAt))
@@ -431,6 +452,16 @@ window.__ModuleLoader__.load({
           }, t('notes.cancel')),
         ])
         : h('div', { key: 'actions', className: 'dsh-nb-actionrow' }, [
+          h('button', {
+            key: 'pin',
+            type: 'button',
+            className: 'dsh-nb-icon',
+            'aria-pressed': note.pinned === true,
+            title: note.pinned ? t('notes.unpin') : t('notes.pin'),
+            'aria-label': note.pinned ? t('notes.unpin') : t('notes.pin'),
+            disabled,
+            onClick: () => { void act({ action: 'pin', id: note.id, pinned: note.pinned !== true }) },
+          }, h(PinGlyph, {})),
           h('button', {
             key: 'edit',
             type: 'button',
@@ -485,6 +516,7 @@ window.__ModuleLoader__.load({
 
     function NotesTab({ t, notes, draft, setDraft, submit, act, busy }) {
       const enabledCount = notes.filter((note) => note.enabled).length
+      const ordered = [...notes].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
       return h('div', { className: 'dsh-nb-stack' }, [
         h('div', { key: 'compose', className: 'dsh-nb-compose' }, [
           h('textarea', {
@@ -516,7 +548,7 @@ window.__ModuleLoader__.load({
         h('div', { key: 'stat', className: 'dsh-nb-stat' }, t('notes.count', { count: notes.length, enabled: enabledCount })),
         notes.length === 0
           ? h(Empty, { key: 'empty', text: t('notes.empty'), icon: NotebookGlyph })
-          : h('div', { key: 'list', className: 'dsh-nb-stack' }, notes.map((note) => h(NoteRow, {
+          : h('div', { key: 'list', className: 'dsh-nb-stack' }, ordered.map((note) => h(NoteRow, {
             key: note.id,
             note,
             t,
@@ -643,6 +675,7 @@ window.__ModuleLoader__.load({
       .dsh-nb-tag{display:inline-flex;align-items:center;padding:0 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}
       .dsh-nb-icon{flex:none;appearance:none;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);width:26px;height:26px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
       .dsh-nb-icon:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary)}
+      .dsh-nb-icon[aria-pressed="true"]{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}
       .dsh-nb-icon:disabled{opacity:.5;cursor:default}
       .dsh-nb-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:48px 20px;color:var(--dsw-alias-label-tertiary);text-align:center}
       .dsh-nb-empty-title{font-size:13px;color:var(--dsw-alias-label-secondary);max-width:400px}
